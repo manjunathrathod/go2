@@ -1,0 +1,162 @@
+name: CI
+
+on:
+  push:
+    branches: [ main, develop, feature/* ]
+  pull_request:
+    branches: [ main, develop ]
+
+env:
+  REGISTRY_NAME: cloudaccelerator.azurecr.io # Set your ACR registry name
+  IMAGE_NAME: myapp_go
+  CLUSTER_NAME: trv-dev-aks
+  RESOURCEGROUP: trv-dev-app-rg
+  AKS_NAMESPACE: default
+
+     
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    permissions:
+      # required for all workflows
+      security-events: write
+
+      # only required for workflows in private repositories
+      actions: read
+      contents: read
+
+    steps:
+    - uses: actions/checkout@v3
+
+    # Setup Go
+    - name: Set up Go
+      uses: actions/setup-go@v2
+      with:
+        go-version: '1.19' # You can specify the version you want
+
+    # Cache Go modules
+    - name: Cache Go modules
+      uses: actions/cache@v2
+      with:
+        path: ~/go/pkg/mod
+        key: ${{ runner.os }}-go-${{ hashFiles('**/go.sum') }}
+        restore-keys: |
+          ${{ runner.os }}-go-
+
+    # Install dependencies
+    - name: Install dependencies
+      run: go mod download
+    
+    - name: Build
+      run: go build -v ./...
+
+    - name: Test
+      run: go test -v ./...
+
+    # Linting
+    - name: Lint Code
+      uses: golangci/golangci-lint-action@v2
+      with:
+        version: v1.41.1 # Specify the version you want
+        config: .golangci.yml
+
+    # Security checks
+    - name: Security Checks
+      run: go install github.com/securego/gosec/v2/cmd/gosec@latest && gosec ./...
+
+    # Analyze code using CodeQL  
+    - name: Initialize CodeQL
+      uses: github/codeql-action/init@v2
+      with:
+        languages: go
+        
+    - name: Perform CodeQL Analysis
+      uses: github/codeql-action/analyze@v2
+
+  build:
+    name: build
+    needs: test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v3
+
+      # Setup Go
+      - name: Set up Go
+        uses: actions/setup-go@v2
+        with:
+          go-version: '1.19' # You can specify the version you want
+  
+      # Cache Go modules
+      - name: Cache Go modules
+        uses: actions/cache@v2
+        with:
+          path: ~/go/pkg/mod
+          key: ${{ runner.os }}-go-${{ hashFiles('**/go.sum') }}
+          restore-keys: |
+            ${{ runner.os }}-go-
+  
+      # Install dependencies
+      - name: Install dependencies
+        run: go mod download
+      
+      - name: Build Application
+        run: go build -o my-application ./...
+        
+      - name: Upload Build Artifact
+        uses: actions/upload-artifact@v2
+        with:
+          name: my-application
+          path: ./my-application
+
+  docker-build-and-push:
+    runs-on: ubuntu-latest
+    needs: test
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v3
+
+      - name: 'Login via Azure CLI'
+        uses: azure/login@v1
+        with:
+          creds: ${{ secrets.AZURE_CREDENTIALS }}
+
+      - name: 'Build and push image'
+        uses: azure/docker-login@v1
+        with:
+          login-server: ${{ env.REGISTRY_NAME }}
+          username: ${{ secrets.ACR_USERNAME }}
+          password: ${{ secrets.ACR_PASSWORD }}
+      - run: |
+          docker build . -t ${{ env.REGISTRY_NAME }}/${{ env.IMAGE_NAME }}:${{ github.sha }}
+          docker push ${{ env.REGISTRY_NAME }}/${{ env.IMAGE_NAME }}:${{ github.sha }}
+
+  Deploy:
+    runs-on: ubuntu-latest
+    needs: [build, docker-build-and-push]
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v3
+
+      - name: Set up kubectl
+        uses: azure/aks-set-context@v1
+        with:
+          creds: '${{ secrets.AZURE_CREDENTIALS }}'
+          cluster-name: ${{ env.CLUSTER_NAME }} # Replace with your AKS cluster name
+          resource-group: ${{ env.RESOURCEGROUP }} # Replace with your resource group
+        
+      - uses: Azure/k8s-create-secret@v1
+        with:
+          container-registry-url: ${{ env.REGISTRY_NAME }}
+          container-registry-username: ${{ secrets.ACR_USERNAME }}
+          container-registry-password: ${{ secrets.ACR_PASSWORD }}
+          secret-name: k8s-secret
+
+      - uses: Azure/k8s-deploy@v1
+        with:
+          manifests: |
+            manifests/deployment.yml
+            manifests/service.yml
+          images: |
+            ${{ env.REGISTRY_NAME }}/${{ env.IMAGE_NAME }}:${{ github.sha }}
+          imagepullsecrets: |
+            k8s-secret

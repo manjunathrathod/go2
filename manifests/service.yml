@@ -1,0 +1,12 @@
+kind: Service
+apiVersion: v1
+metadata:
+  name:  go-svc
+spec:
+  selector:
+    app:  go
+  type:  LoadBalancer
+  ports:
+  - name:  http
+    port:  80
+    targetPort: 8080
